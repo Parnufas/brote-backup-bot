@@ -228,11 +228,13 @@ class IsolatedPostgres:
 
     def restore(self, directory):
         directory = Path(directory)
+        set_stage('RESTORE_ROLES')
         roles = json.loads((directory / 'roles.json').read_text())
         for role in roles:
             if role[0] != 'postgres':
                 self.query('CREATE ROLE ' + ident(role[0]) + ' NOLOGIN')
         # Payload preserves original ACL/ownership; drill intentionally uses postgres ownership.
+        set_stage('RESTORE_DUMP')
         with (directory / 'database.dump').open('rb') as dump:
             run(DOCKER + ['exec','-i',self.name,'pg_restore','-h','/tmp','-U','postgres','-d','postgres',
                          '--exit-on-error','--no-owner','--no-publications','--no-subscriptions'], input_file=dump)
@@ -240,10 +242,12 @@ class IsolatedPostgres:
 
     def verify(self, directory):
         directory = Path(directory)
+        set_stage('RESTORE_STRUCTURE')
         expected = json.loads((directory / 'database.json').read_text())
         actual_structure = normalize_structure(json.loads(self.query('SET search_path=pg_catalog;\n' + STRUCTURE)))
         if canonical(actual_structure) != canonical(expected['structure']):
-            raise RuntimeError('Restored structure differs from snapshot')
+            raise SafeFailure('RESTORE_STRUCTURE_MISMATCH')
+        set_stage('RESTORE_DATA')
         for schema, table in expected['tables']:
             # Stream COPY output to disk, never to Actions logs or process memory.
             output = directory / 'rows.check'
@@ -251,7 +255,7 @@ class IsolatedPostgres:
             with output.open('wb') as f:
                 run(DOCKER + ['exec','-i',self.name,'psql','-X','-h','/tmp','-U','postgres',
                              '-v','ON_ERROR_STOP=1','-Atq'],
-                    data=("SET timezone='UTC';\n" + query + ';\n').encode(), output=f)
+                    data=("SET timezone='UTC'; SET search_path=pg_catalog;\n" + query + ';\n').encode(), output=f)
             # COPY text escapes backslashes and control characters; decode before hashing.
             h = hashlib.sha256()
             count = 0
@@ -262,5 +266,5 @@ class IsolatedPostgres:
                     count += 1
             output.unlink()
             if expected['fingerprints'][f'{schema}.{table}'] != {'rows':count,'sha256':h.hexdigest()}:
-                raise RuntimeError('Restored data differs from snapshot')
+                raise SafeFailure('RESTORE_DATA_MISMATCH')
         return len(expected['tables'])

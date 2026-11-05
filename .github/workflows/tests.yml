@@ -13,3 +13,5 @@ jobs:
       - run: python3 -m unittest discover -s tests -v
       - name: Verify psycopg and Docker pg_dump TLS against synthetic PostgreSQL
         run: python3 tests/tls_integration.py
+      - name: Restore Supabase-shaped synthetic database with the production image
+        run: python3 tests/restore_integration.py
