@@ -6,10 +6,13 @@ from pathlib import Path
 import re
 import time
 import uuid
+import ssl
+import tempfile
+from contextlib import contextmanager
 
 import psycopg
 from psycopg import sql
-from core import run, write_json, set_stage
+from core import run, write_json, set_stage, SafeFailure
 from settings import config
 
 # Updated deliberately, never selected by workflow_dispatch or PR code.
@@ -82,7 +85,27 @@ def row_query(schema, table):
     return f'SELECT to_jsonb(t)::text FROM ONLY {ident(schema)}.{ident(table)} t ORDER BY to_jsonb(t)::text COLLATE "C"'
 
 
-def connection_env():
+@contextmanager
+def postgres_ca():
+    """Project CA is ephemeral, outside the backup payload, and never logged."""
+    set_stage('PG_CONFIG')
+    pem = os.environ.get('BACKUP_PG_CA_PEM','').strip()
+    if not pem:raise SafeFailure('PG_CA_MISSING')
+    if len(pem) > 131072 or not re.fullmatch(
+            r'(?:-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+',pem):
+        raise SafeFailure('PG_CA_INVALID')
+    with tempfile.TemporaryDirectory(prefix='brote-ca-',dir=os.environ.get('RUNNER_TEMP')) as directory:
+        path = Path(directory) / 'root-ca.pem'
+        with open(path,'x',opener=lambda p,f:os.open(p,f,0o600)) as output:
+            output.write(pem+'\n')
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cafile=str(path))
+        except (ssl.SSLError,ValueError):
+            raise SafeFailure('PG_CA_INVALID') from None
+        yield path
+
+
+def connection_env(ca_path):
     env = os.environ.copy()
     for key in ('PGHOST', 'PGUSER', 'PGPASSWORD', 'PGDATABASE'):
         if not env.get(key):
@@ -96,15 +119,25 @@ def connection_env():
         raise RuntimeError('Unexpected PostgreSQL host')
     if env.get('PGPORT', '5432') != '5432' or env['PGDATABASE'] != 'postgres':
         raise RuntimeError('Use direct connection or session pooler on port 5432')
-    env.update(PGSSLMODE='verify-full', PGSSLROOTCERT='/etc/ssl/certs/ca-certificates.crt',
+    env.update(PGSSLMODE='verify-full', PGSSLROOTCERT=str(Path(ca_path).resolve(strict=True)),
                PGCONNECT_TIMEOUT='30', PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=1800000 -c timezone=UTC')
     return env
 
 
-def capture(destination):
+def dump_args(snapshot, env):
+    args = DOCKER + ['run','--rm','--entrypoint','pg_dump']
+    for name in ('PGHOST','PGUSER','PGPASSWORD','PGDATABASE','PGSSLMODE','PGCONNECT_TIMEOUT','PGOPTIONS'):
+        args += ['-e',name]
+    args += ['-e','PGSSLROOTCERT=/run/ca.pem','--mount',
+             f"type=bind,src={env['PGSSLROOTCERT']},dst=/run/ca.pem,readonly",
+             IMAGE,'--format=custom','--snapshot='+snapshot,'--no-publications','--no-subscriptions']
+    return args
+
+
+def capture(destination, ca_path):
     destination = Path(destination)
     set_stage('PG_CONFIG')
-    env = connection_env()
+    env = connection_env(ca_path)
     params = {k[2:].lower(): env[k] for k in ('PGHOST', 'PGUSER', 'PGPASSWORD', 'PGDATABASE')}
     params['dbname'] = params.pop('database')
     params.update(port=5432, sslmode='verify-full', sslrootcert=env['PGSSLROOTCERT'], connect_timeout=30)
@@ -143,12 +176,7 @@ def capture(destination):
         set_stage('PG_SCHEMA')
         structure = normalize_structure(conn.execute(STRUCTURE).fetchone()[0])
         # The same exported snapshot backs both the dump and all verification evidence.
-        args = DOCKER + ['run', '--rm', '--entrypoint', 'pg_dump']
-        for name in ('PGHOST','PGUSER','PGPASSWORD','PGDATABASE','PGSSLMODE','PGCONNECT_TIMEOUT','PGOPTIONS'):
-            args += ['-e', name]
-        args += ['-e', 'PGSSLROOTCERT=/run/ca.pem', '--mount',
-                 'type=bind,src=/etc/ssl/certs/ca-certificates.crt,dst=/run/ca.pem,readonly',
-                 IMAGE, '--format=custom', '--snapshot=' + snapshot, '--no-publications', '--no-subscriptions']
+        args = dump_args(snapshot, env)
         with open(destination / 'database.dump', 'wb') as output:
             set_stage('PG_DUMP')
             run(args, env=env, output=output)

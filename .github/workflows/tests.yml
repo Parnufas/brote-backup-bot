@@ -11,3 +11,5 @@ jobs:
           persist-credentials: false
       - run: python3 -m pip install -r runtime/requirements.txt
       - run: python3 -m unittest discover -s tests -v
+      - name: Verify psycopg and Docker pg_dump TLS against synthetic PostgreSQL
+        run: python3 tests/tls_integration.py

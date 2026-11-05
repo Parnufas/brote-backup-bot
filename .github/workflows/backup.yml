@@ -47,6 +47,7 @@ jobs:
           PGHOST: ${{ secrets.BACKUP_PGHOST }}
           PGUSER: ${{ secrets.BACKUP_PGUSER }}
           PGPASSWORD: ${{ secrets.BACKUP_PGPASSWORD }}
+          BACKUP_PG_CA_PEM: ${{ secrets.BACKUP_PG_CA_PEM }}
           PGDATABASE: postgres
           PGPORT: '5432'
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.BACKUP_STORAGE_SERVICE_ROLE_KEY }}
