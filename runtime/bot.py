@@ -13,7 +13,7 @@ import tempfile
 from core import (GitHub,
                   guard, now, write_json, encrypt, decrypt, publish, fetch_bundle,
                   retention_keep)
-from database import IMAGE, DOCKER, capture, IsolatedPostgres
+from database import IMAGE, DOCKER, capture, IsolatedPostgres, postgres_ca
 from storage import capture_bytes, verify_bytes
 from core import run, set_stage, failure_code, SafeFailure
 from settings import config, controller_repo, vault_repo, source_repo, mask_private_config
@@ -103,10 +103,11 @@ def backup():
             data.mkdir(mode=0o700)
             started = now()
             print('Brote Backup Bot: capturing consistent PostgreSQL snapshot',flush=True)
-            version = capture(data)
-            print('Brote Backup Bot: capturing and reconciling Storage bytes',flush=True)
-            set_stage('STORAGE_BYTES')
-            object_count, storage_bytes = capture_bytes(data)
+            with postgres_ca() as ca_path:
+                version = capture(data, ca_path)
+                print('Brote Backup Bot: capturing and reconciling Storage bytes',flush=True)
+                set_stage('STORAGE_BYTES')
+                object_count, storage_bytes = capture_bytes(data, ca_path)
             print('Brote Backup Bot: encrypting and publishing private backup',flush=True)
             set_stage('ENCRYPT')
             encrypted = encrypt(data, work, password)

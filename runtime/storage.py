@@ -17,7 +17,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise RuntimeError('Storage redirects are forbidden')
 
 
-def capture_bytes(directory):
+def capture_bytes(directory, ca_path):
     directory = Path(directory)
     inventory = json.loads((directory / 'storage.json').read_text())
     key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY', '')
@@ -51,7 +51,7 @@ def capture_bytes(directory):
             raise RuntimeError('Storage object changed since database snapshot')
         index.append(dict(item, file='objects/' + name, sha256=sha(path), bytes=path.stat().st_size))
     # Detect additions, overwrites, and removals while bytes were being fetched.
-    env = connection_env()
+    env = connection_env(ca_path)
     with psycopg.connect(host=env['PGHOST'],user=env['PGUSER'],password=env['PGPASSWORD'],
                          dbname=env['PGDATABASE'],port=5432,sslmode='verify-full',
                          sslrootcert=env['PGSSLROOTCERT'],connect_timeout=30,

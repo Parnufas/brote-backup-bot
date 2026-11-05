@@ -72,18 +72,20 @@ class BackupTests(unittest.TestCase):
         conn.execute.side_effect=execute
         conn.__enter__.return_value=conn
         env={'PGHOST':'db.abcdefghijklmnopqrst.supabase.co','PGUSER':'postgres','PGPASSWORD':'synthetic',
-             'PGDATABASE':'postgres','PGSSLROOTCERT':'/etc/ssl/certs/ca-certificates.crt'}
+             'PGDATABASE':'postgres','PGSSLROOTCERT':str(Path(__file__).resolve())}
         with tempfile.TemporaryDirectory() as scratch,patch.object(database,'connection_env',return_value=env), \
                 patch.object(database.psycopg,'connect',return_value=conn) as connect,patch.object(database,'run') as dump:
-            database.capture(scratch)
+            database.capture(scratch,__file__)
             self.assertTrue(connect.call_args.kwargs['autocommit'])
             self.assertEqual(connect.call_args.kwargs['sslmode'],'verify-full')
             self.assertEqual(queries[0],'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
             self.assertIn('--snapshot=fixture-snapshot',dump.call_args.args[0])
+            self.assertEqual(connect.call_args.kwargs['sslrootcert'],env['PGSSLROOTCERT'])
+            self.assertIn('type=bind,src='+env['PGSSLROOTCERT']+',dst=/run/ca.pem,readonly',dump.call_args.args[0])
 
     def test_bad_host_format_rejected_without_network(self):
         env={'PGHOST':'postgresql://CANARY_HOST/postgres','PGUSER':'postgres','PGPASSWORD':'synthetic','PGDATABASE':'postgres'}
-        with patch.dict(os.environ,env),self.assertRaises(RuntimeError):connection_env()
+        with patch.dict(os.environ,env),self.assertRaises(RuntimeError):connection_env(__file__)
 
     def test_api_error_category_contains_no_request_details(self):
         core.set_stage('HEALTH_NOTIFY')
@@ -91,6 +93,16 @@ class BackupTests(unittest.TestCase):
         output=core.failure_code(RuntimeError('CANARY_TOKEN https://CANARY_HOST/private'))
         self.assertIn('category=UNCLASSIFIED',output)
         self.assertNotIn('CANARY',output)
+
+    def test_ca_secret_is_required_and_malformed_values_are_not_echoed(self):
+        for value,category in [('', 'PG_CA_MISSING'),('CANARY_PRIVATE_CONTENT','PG_CA_INVALID'),
+                ('-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----','PG_CA_INVALID'),
+                ('-----BEGIN PRIVATE KEY-----\nCANARY\n-----END PRIVATE KEY-----','PG_CA_INVALID')]:
+            with self.subTest(category=category),patch.dict(os.environ,{'BACKUP_PG_CA_PEM':value}):
+                with self.assertRaises(core.SafeFailure) as result:
+                    with database.postgres_ca():pass
+                self.assertEqual(result.exception.category,category)
+                self.assertNotIn('CANARY',core.failure_code(result.exception))
 
     def test_health_reports_absence_of_valid_backup_explicitly(self):
         source=Mock();vault=Mock()
@@ -172,9 +184,9 @@ class BackupTests(unittest.TestCase):
         good={'PGHOST':'db.abcdefghijklmnopqrst.supabase.co','PGUSER':'postgres',
               'PGPASSWORD':'synthetic','PGDATABASE':'postgres','PGPORT':'5432'}
         with patch.dict(os.environ,good):
-            self.assertEqual(connection_env()['PGSSLMODE'],'verify-full')
+            self.assertEqual(connection_env(__file__)['PGSSLMODE'],'verify-full')
             for key,value in [('PGHOST','attacker.example'),('PGPORT','6543'),('PGDATABASE','other')]:
-                with patch.dict(os.environ,{key:value}),self.assertRaises(RuntimeError):connection_env()
+                with patch.dict(os.environ,{key:value}),self.assertRaises(RuntimeError):connection_env(__file__)
 
     def test_unapproved_commit_is_rejected_before_api_access(self):
         controller=Mock();vault=Mock()
@@ -242,9 +254,9 @@ class BackupTests(unittest.TestCase):
                         patch.object(storage,'connection_env',return_value=env), \
                         patch.object(storage.psycopg,'connect',return_value=conn):
                     if changed:
-                        with self.assertRaisesRegex(RuntimeError,'inventory changed'):storage.capture_bytes(root)
+                        with self.assertRaisesRegex(RuntimeError,'inventory changed'):storage.capture_bytes(root,__file__)
                     else:
-                        self.assertEqual(storage.capture_bytes(root),(1,4))
+                        self.assertEqual(storage.capture_bytes(root,__file__),(1,4))
                         self.assertEqual(verify_bytes(root),1)
 
     def test_changed_pr_cannot_reuse_migration_gate(self):
@@ -275,7 +287,7 @@ class BackupTests(unittest.TestCase):
                 'BACKUP_MODE':'daily','GITHUB_SHA':'synthetic','GITHUB_RUN_ID':'1',
                 'BACKUP_ENCRYPTION_PASSWORD':'synthetic-'*8,'GITHUB_STEP_SUMMARY':root+'/summary'}), \
                 patch.object(bot,'clients',return_value=(source,vault)), \
-                patch.object(bot,'run'),patch.object(bot,'capture',return_value='170006'), \
+                patch.object(bot,'postgres_ca') as ca,patch.object(bot,'run'),patch.object(bot,'capture',return_value='170006'), \
                 patch.object(bot,'capture_bytes',return_value=(0,0)),patch.object(bot,'encrypt'), \
                 patch.object(bot,'publish',return_value={'id':1}), \
                 patch.object(bot,'fetch_bundle',return_value=(Path(root)/'cipher',{})), \
