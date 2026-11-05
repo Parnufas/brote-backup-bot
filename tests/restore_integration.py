@@ -74,6 +74,12 @@ def main():
         with IsolatedPostgres() as source:
             print("Synthetic image PostgreSQL version:",source.query("SHOW server_version_num"),flush=True)
             fixture(source)
+            structure=json.loads(source.query('SET search_path=pg_catalog;'+STRUCTURE))
+            for section,field in [('columns','table_schema'),('constraints','schema'),('indexes','schemaname'),('views','schemaname'),('rls','schema')]:
+                selected=[r for r in structure[section] or [] if r[field] in ('extensions','vault')]
+                # Public synthetic image metadata only, to compare extension compatibility.
+                value=json.dumps(selected).replace("'","''")
+                print('Synthetic extension '+section+':',source.query("select md5(coalesce(jsonb_agg(item order by item::text collate \"C\"),'[]'::jsonb)::text) from jsonb_array_elements('"+value+"'::jsonb) item"),flush=True)
             count=capture_fixture(source,data)
         with IsolatedPostgres() as target:
             target.restore(data)
