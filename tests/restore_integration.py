@@ -72,6 +72,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='brote-restore-fixture-') as scratch:
         data=Path(scratch)
         with IsolatedPostgres() as source:
+            print("Synthetic image PostgreSQL version:",source.query("SHOW server_version_num"),flush=True)
             fixture(source)
             count=capture_fixture(source,data)
         with IsolatedPostgres() as target:
