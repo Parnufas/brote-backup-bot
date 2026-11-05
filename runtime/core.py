@@ -15,6 +15,67 @@ from settings import config, controller_repo, vault_repo
 CHUNK_SIZE = 512 * 1024 * 1024
 MAX_BYTES = 4 * 1024 * 1024 * 1024
 
+STAGES = {'START','CONTROL','PG_CONFIG','PG_CONNECT','PG_TRANSACTION','PG_CATALOG',
+          'PG_ROWS','PG_SCHEMA','PG_DUMP','PG_STORAGE_CATALOG','STORAGE_BYTES',
+          'ENCRYPT','PUBLISH','DOWNLOAD','DECRYPT','RESTORE','REHEARSAL','VALIDATION',
+          'RETENTION','HEALTH_CONTROL','HEALTH_READ','HEALTH_NOTIFY','HEALTH_RESULT'}
+_stage = 'START'
+SQLSTATES = {'28P01','28000','42501','25001','25006','42P01','42703','08001',
+             '08004','08006','53300','53400','57014','55P03','0A000'}
+CATEGORIES = {'PG_AUTHENTICATION','PG_PERMISSION','PG_TLS_VERIFY','PG_TLS',
+              'PG_DNS','PG_TIMEOUT','PG_NETWORK','PG_CLIENT_CONFIG','PG_TRANSACTION',
+              'PG_SCHEMA','PG_CAPACITY','PG_QUERY_CANCELLED','PG_CONFIG_INVALID',
+              'PG_UNKNOWN','TOOL_FAILED','BACKUP_UNHEALTHY','HEALTH_UNAVAILABLE','NO_VALID_BACKUP',
+              'API_AUTHENTICATION','API_FORBIDDEN','API_NOT_FOUND','API_RATE_LIMIT','API_FAILED','UNCLASSIFIED'}
+
+
+def set_stage(value):
+    global _stage
+    if value not in STAGES:raise ValueError('Unknown diagnostic stage')
+    _stage = value
+    print('Brote Backup Bot: stage=' + value, flush=True)
+
+
+class SafeFailure(RuntimeError):
+    def __init__(self, category):
+        if category not in CATEGORIES:raise ValueError('Unknown diagnostic category')
+        self.category = category
+        super().__init__('Operation failed')
+
+
+def pg_category(message, state=None):
+    # Inspect locally, emit only a fixed category. Never return any message fragment.
+    if state in {'28P01','28000'}:return 'PG_AUTHENTICATION'
+    if state == '42501':return 'PG_PERMISSION'
+    if state in {'25001','25006'}:return 'PG_TRANSACTION'
+    if state in {'42P01','42703','0A000'}:return 'PG_SCHEMA'
+    if state in {'53300','53400'}:return 'PG_CAPACITY'
+    if state == '57014':return 'PG_QUERY_CANCELLED'
+    message = message.lower()
+    if any(s in message for s in ('certificate verify failed','root certificate','server certificate','certificate does not match')):return 'PG_TLS_VERIFY'
+    if any(s in message for s in ('ssl error','tls error','ssl connection','ssl is not enabled','does not support ssl')):return 'PG_TLS'
+    if any(s in message for s in ('password authentication failed','authentication failed','tenant or user not found','no pg_hba.conf entry')):return 'PG_AUTHENTICATION'
+    if any(s in message for s in ('could not translate host name','name or service not known','name resolution','nodename nor servname')):return 'PG_DNS'
+    if any(s in message for s in ('timeout expired','timed out','connection timeout')):return 'PG_TIMEOUT'
+    if any(s in message for s in ('connection refused','network is unreachable','no route to host','server closed the connection')):return 'PG_NETWORK'
+    if any(s in message for s in ('invalid connection option','invalid conninfo','missing "="','invalid port number')):return 'PG_CLIENT_CONFIG'
+    if 'permission denied' in message:return 'PG_PERMISSION'
+    return 'PG_UNKNOWN'
+
+
+def failure_code(error):
+    state = getattr(error,'sqlstate',None)
+    state = state if state in SQLSTATES else 'NONE'
+    category = getattr(error,'category',None)
+    if category not in CATEGORIES:
+        message=str(error)
+        api=re.fullmatch(r'GitHub (?:GET|POST|PATCH|DELETE|PUT) failed \((\d{3})\)',message)
+        category = ('PG_CONFIG_INVALID' if _stage == 'PG_CONFIG' else
+                    pg_category(message,state) if _stage.startswith('PG_') else
+                    {'401':'API_AUTHENTICATION','403':'API_FORBIDDEN','404':'API_NOT_FOUND',
+                     '429':'API_RATE_LIMIT'}.get(api[1],'API_FAILED') if api else 'UNCLASSIFIED')
+    return f'BROTE_BACKUP stage={_stage} category={category} sqlstate={state}'
+
 
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat()
@@ -37,6 +98,8 @@ def run(args, *, env=None, data=None, output=None, input_file=None):
     result = subprocess.run(args, env=env, input=data, stdin=input_file, stdout=output or subprocess.PIPE,
                             stderr=subprocess.PIPE, check=False)
     if result.returncode:
+        if _stage == 'PG_DUMP':
+            raise SafeFailure(pg_category(result.stderr.decode('utf-8',errors='replace')))
         raise RuntimeError("Subprocess failed: " + Path(args[0]).name)
     return result.stdout
 

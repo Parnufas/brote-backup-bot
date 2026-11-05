@@ -15,7 +15,7 @@ from core import (GitHub,
                   retention_keep)
 from database import IMAGE, DOCKER, capture, IsolatedPostgres
 from storage import capture_bytes, verify_bytes
-from core import run
+from core import run, set_stage, failure_code, SafeFailure
 from settings import config, controller_repo, vault_repo, source_repo, mask_private_config
 
 
@@ -82,6 +82,7 @@ def public_summary(message):
 
 
 def backup():
+    set_stage('CONTROL')
     print('Brote Backup Bot: checking protected main and private vault',flush=True)
     controller, vault = clients()
     mode = os.environ.get('BACKUP_MODE', 'daily')
@@ -104,8 +105,10 @@ def backup():
             print('Brote Backup Bot: capturing consistent PostgreSQL snapshot',flush=True)
             version = capture(data)
             print('Brote Backup Bot: capturing and reconciling Storage bytes',flush=True)
+            set_stage('STORAGE_BYTES')
             object_count, storage_bytes = capture_bytes(data)
             print('Brote Backup Bot: encrypting and publishing private backup',flush=True)
+            set_stage('ENCRYPT')
             encrypted = encrypt(data, work, password)
             metadata = {'backup_started_at':started,'backup_completed_at':now(),
                         'source_commit':os.environ['GITHUB_SHA'],'project':config()['project_ref'],
@@ -113,11 +116,15 @@ def backup():
                         'storage_objects':object_count,'storage_bytes':storage_bytes,
                         'pre_migration':mode == 'pre-migration',
                         'run_url':f"https://github.com/{controller_repo()}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
+            set_stage('PUBLISH')
             release = publish(vault, encrypted, work, metadata)
         print('Brote Backup Bot: downloading and verifying stored ciphertext',flush=True)
+        set_stage('DOWNLOAD')
         encrypted, manifest = fetch_bundle(vault, release, work)
+        set_stage('DECRYPT')
         decrypt(encrypted, work / 'restored', work, password)
         object_count = verify_bytes(work / 'restored')
+        set_stage('RESTORE')
         with IsolatedPostgres() as database:
             print('Brote Backup Bot: restoring and comparing structure and data in isolation',flush=True)
             tables = database.restore(work / 'restored')
@@ -125,6 +132,7 @@ def backup():
             if mode == 'pre-migration':
                 print('Brote Backup Bot: rehearsing approved migration in isolation',flush=True)
                 before_rehearsal(database, work / 'restored')
+                set_stage('REHEARSAL')
                 rehearsal = rehearse(source, database, work, spec)
         validation = {'valid':True,'backup_sha256':manifest['sha256'],
                       'backup_completed_at':manifest['backup_completed_at'],
@@ -139,9 +147,11 @@ def backup():
             path = work / 'validation.json'
         write_json(path, validation)
         print('Brote Backup Bot: persisting successful validation',flush=True)
+        set_stage('VALIDATION')
         vault.upload(release, path)
         # Only prune after a full successful round-trip. Refuse public vault again before deletes.
         guard(controller, vault)
+        set_stage('RETENTION')
         prune(vault)
         public_summary('Backup and isolated restore completed. Detailed status is private.')
 
@@ -195,11 +205,16 @@ def set_issue(vault, title, body, *, state='open'):
 def monitor():
     controller = GitHub(os.environ.get('GITHUB_TOKEN'))
     vault = GitHub(os.environ.get('BACKUP_VAULT_TOKEN'))
+    set_stage('HEALTH_CONTROL')
     failure = os.environ.get('BACKUP_JOB_RESULT','success') != 'success'
+    health_error = None
     try:
         guard(controller, vault)
+        set_stage('HEALTH_READ')
         values = records(vault)
-        release, validation = next((r,r['validation']) for r in values if r['valid'])
+        valid = next(((r,r['validation']) for r in values if r['valid']),None)
+        if valid is None:raise SafeFailure('NO_VALID_BACKUP')
+        release, validation = valid
         last_backup = dt.datetime.fromisoformat(validation['backup_completed_at'])
         last_restore = dt.datetime.fromisoformat(validation['restore_succeeded_at'])
         # Newer repeat-restore records may advance the last successful restore date.
@@ -219,17 +234,22 @@ def monitor():
                 f"Respaldo: `{release['tag_name']}` · [almacén privado]({release['html_url']})\n\n"
                 f"Comprobado: {now()}. Caduca a las 30 h sin nuevo backup/restauración.\n\n"
                 'Cada ejecución diaria restaura la copia descargada y verifica estructura, datos y bytes de Storage.\n')
-    except Exception:
+    except Exception as error:
+        health_error = error
+        print('::error::' + failure_code(error),flush=True)
         failure = True
         body = f'**SIN BACKUP VÁLIDO COMPROBABLE**\n\nComprobado: {now()}. Revisar configuración y ejecución; no autorizar migraciones destructivas.'
     run_url = f"https://github.com/{controller_repo()}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
     body += f'\n[Última comprobación]({run_url})\n'
+    set_stage('HEALTH_NOTIFY')
     set_issue(vault,'Brote Backup Bot · estado',body)
     set_issue(vault,'Brote Backup Bot · fallo de backup o restauración',body,
               state='open' if failure else 'closed')
     public_summary('Health check failed. See the private vault.' if failure else 'Health check passed. Detailed status is private.')
     if failure:
-        raise RuntimeError('Backup health check failed')
+        set_stage('HEALTH_RESULT')
+        if health_error is not None and isinstance(health_error,SafeFailure):raise health_error
+        raise SafeFailure('HEALTH_UNAVAILABLE' if health_error else 'BACKUP_UNHEALTHY')
 
 
 if __name__ == '__main__':
@@ -238,6 +258,7 @@ if __name__ == '__main__':
         mask_private_config()
         {'backup':backup,'monitor':monitor}[sys.argv[1]]()
     except Exception as error:
+        print('::error::' + failure_code(error),flush=True)
         # Never emit exception text / traceback: responses can contain PII or credentials.
         # Our exact RuntimeError instances contain only fixed, sanitized diagnostics.
         # Public logs must not include even fragments of private exception data.
