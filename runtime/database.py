@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import time
 import uuid
+import copy
 import ssl
 import tempfile
 from contextlib import contextmanager
@@ -75,6 +76,18 @@ def canonical(value):
 
 
 def normalize_structure(value):
+    value = copy.deepcopy(value)
+    # attnum/ordinal_position includes holes left by DROP COLUMN. A logical
+    # dump recreates visible columns densely. Preserve their relative order,
+    # not unobservable historical storage slots; keep every other attribute.
+    groups = {}
+    for column in value.get('columns') or []:
+        groups.setdefault((column['table_schema'],column['table_name']),[]).append(column)
+    for columns in groups.values():
+        for position,column in enumerate(sorted(columns,key=lambda c:c['ordinal_position']),1):
+            column['ordinal_position'] = position
+    if value.get('columns') is not None:
+        value['columns'] = sorted(value['columns'],key=lambda c:(c['table_schema'],c['table_name'],c['ordinal_position']))
     # Policy role arrays are name-sorted by PostgreSQL; normalize defensively.
     for policy in value.get('policies') or []:
         policy['roles'] = sorted(policy['roles'])
@@ -245,7 +258,7 @@ class IsolatedPostgres:
         set_stage('RESTORE_STRUCTURE')
         expected = json.loads((directory / 'database.json').read_text())
         actual_structure = normalize_structure(json.loads(self.query('SET search_path=pg_catalog;\n' + STRUCTURE)))
-        if canonical(actual_structure) != canonical(expected['structure']):
+        if canonical(actual_structure) != canonical(normalize_structure(expected['structure'])):
             raise SafeFailure('RESTORE_STRUCTURE_MISMATCH')
         set_stage('RESTORE_DATA')
         for schema, table in expected['tables']:

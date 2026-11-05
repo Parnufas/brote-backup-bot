@@ -8,7 +8,7 @@ import tempfile
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'runtime'))
 import database
 from database import IsolatedPostgres,TABLES,STRUCTURE,DOCKER,row_query
-from core import run,write_json
+from core import run,write_json,SafeFailure
 
 ROLES=['anon','authenticated','service_role','authenticator','supabase_admin','supabase_auth_admin',
        'supabase_storage_admin','supabase_replication_admin','supabase_functions_admin',
@@ -32,9 +32,15 @@ create type public.fixture_state as enum ('new','saved');
 create table public.fixture_events(id int generated always as identity primary key,body jsonb,payload bytea,state public.fixture_state);
 insert into public.fixture_events(body,payload,state) values ('{"text":"Niño 日本語 \\n \\\\"}',decode('00ffabcd','hex'),'saved');
 create table auth.fixture_users(id uuid primary key);
+alter table auth.fixture_users add column legacy_a text,add column retained text,add column legacy_b text,add column note jsonb;
+alter table auth.fixture_users drop column legacy_a,drop column legacy_b;
+alter table auth.fixture_users add column retained_length int generated always as(length(retained)) stored;
+insert into auth.fixture_users(id,retained,note) values('00000000-0000-0000-0000-000000000001','synthetic','{"fixture":true}');
 create table storage.fixture_objects(id int primary key,user_id uuid references auth.fixture_users(id),metadata jsonb);
 create table realtime.fixture_refs(id int primary key,entity regclass,datatype regtype);
+create table storage.fixture_events(id int primary key);
 insert into realtime.fixture_refs values(1,'public.fixture_events'::regclass,'public.fixture_state'::regtype);
+insert into realtime.fixture_refs values(2,'storage.fixture_events'::regclass,'public.fixture_state'::regtype);
 alter table public.fixture_events enable row level security;
 create policy fixture_owner on public.fixture_events to authenticated using (true);
 grant select on public.fixture_events to authenticated;
@@ -72,17 +78,28 @@ def main():
     with tempfile.TemporaryDirectory(prefix='brote-restore-fixture-') as scratch:
         data=Path(scratch)
         with IsolatedPostgres() as source:
-            print("Synthetic image PostgreSQL version:",source.query("SHOW server_version_num"),flush=True)
             fixture(source)
-            structure=json.loads(source.query('SET search_path=pg_catalog;'+STRUCTURE))
-            for section,field in [('columns','table_schema'),('constraints','schema'),('indexes','schemaname'),('views','schemaname'),('rls','schema')]:
-                selected=[r for r in structure[section] or [] if r[field] in ('extensions','vault')]
-                # Public synthetic image metadata only, to compare extension compatibility.
-                value=json.dumps(selected).replace("'","''")
-                print('Synthetic extension '+section+':',source.query("select md5(coalesce(jsonb_agg(item order by item::text collate \"C\"),'[]'::jsonb)::text) from jsonb_array_elements('"+value+"'::jsonb) item"),flush=True)
             count=capture_fixture(source,data)
         with IsolatedPostgres() as target:
             target.restore(data)
+            assert target.query("select nextval('public.fixture_events_id_seq')")=='2'
+            assert target.query("select count(*) from pg_roles where rolname !~ '^pg_' and rolname<>'postgres' and rolcanlogin")=='0'
+            target.query("update realtime.fixture_refs set entity='storage.fixture_events'::regclass where id=1")
+            try:target.verify(data)
+            except SafeFailure as error:assert error.category=='RESTORE_DATA_MISMATCH'
+            else:raise AssertionError('Changed object reference accepted')
+            target.query("update realtime.fixture_refs set entity='public.fixture_events'::regclass where id=1")
+            target.verify(data)
+            target.query('alter table auth.fixture_users alter column retained set not null')
+            try:target.verify(data)
+            except SafeFailure as error:assert error.category=='RESTORE_STRUCTURE_MISMATCH'
+            else:raise AssertionError('Changed nullability accepted')
+            target.query('alter table auth.fixture_users alter column retained drop not null')
+            target.verify(data)
+            target.query('alter table public.fixture_events add column unexpected int')
+            try:target.verify(data)
+            except SafeFailure as error:assert error.category=='RESTORE_STRUCTURE_MISMATCH'
+            else:raise AssertionError('Changed structure accepted')
         print(f'PASS: Supabase-shaped synthetic restore with 16 roles, 9 schemas, 5 owners, 6 event triggers and {count} tables.')
 
 

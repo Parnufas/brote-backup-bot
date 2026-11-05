@@ -306,6 +306,8 @@ def retention_keep(records, current):
                 seen.add(key)
     for record in records:
         age = current - dt.datetime.fromisoformat(record["created_at"].replace("Z", "+00:00"))
-        if record.get("pinned") or age < dt.timedelta(days=7) or (record.get("pre_migration") and age < dt.timedelta(days=30)):
+        # A failed drill is not authorization to discard the only encrypted copy.
+        # Keep unvalidated copies private until the owner explicitly reviews them.
+        if not record.get('valid') or record.get("pinned") or age < dt.timedelta(days=7) or (record.get("pre_migration") and age < dt.timedelta(days=30)):
             keep.add(record["id"])
     return keep
