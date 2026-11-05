@@ -60,6 +60,39 @@ class BackupTests(unittest.TestCase):
         self.assertIn('category=PG_PERMISSION',core.failure_code(raised.exception))
         self.assertNotIn('CANARY',str(raised.exception))
 
+    def test_restore_errors_do_not_echo_private_names_or_sql(self):
+        for stage in ('RESTORE_ROLES','RESTORE_DUMP'):
+            core.set_stage(stage)
+            result=Mock(returncode=1,stderr=b'ERROR: role "CANARY_PRIVATE" already exists SQL CANARY_SECRET',stdout=b'')
+            with patch.object(core.subprocess,'run',return_value=result),self.assertRaises(core.SafeFailure) as error:
+                core.run(['docker','fixture'])
+            code=core.failure_code(error.exception)
+            self.assertIn('category=RESTORE_OBJECT_EXISTS',code)
+            self.assertNotIn('CANARY',code)
+
+    def test_unvalidated_copy_is_retained_even_after_normal_expiry(self):
+        current=dt.datetime.now(dt.timezone.utc)
+        old={'id':99,'created_at':(current-dt.timedelta(days=365)).isoformat(),'valid':False}
+        self.assertIn(99,retention_keep([old],current))
+
+    def test_logical_column_order_ignores_only_dropped_storage_slots(self):
+        import copy
+        def col(name,position,**extra):
+            return dict(table_schema='auth',table_name='fixture',column_name=name,
+                        ordinal_position=position,data_type='text',is_nullable='YES',**extra)
+        legacy={'columns':[col('id',1),col('retained',3),col('note',5)],'policies':[]}
+        fresh={'columns':[col('id',1),col('retained',2),col('note',3)],'policies':[]}
+        self.assertEqual(database.normalize_structure(legacy),database.normalize_structure(fresh))
+        self.assertEqual(legacy['columns'][1]['ordinal_position'],3)
+        self.assertEqual(database.normalize_structure(database.normalize_structure(legacy)),database.normalize_structure(legacy))
+        for attribute,value in [('column_name','other'),('data_type','integer'),('is_nullable','NO')]:
+            changed=copy.deepcopy(fresh);changed['columns'][1][attribute]=value
+            self.assertNotEqual(database.normalize_structure(legacy),database.normalize_structure(changed))
+        reordered=copy.deepcopy(fresh)
+        reordered['columns'][1]['ordinal_position']=3
+        reordered['columns'][2]['ordinal_position']=2
+        self.assertNotEqual(database.normalize_structure(legacy),database.normalize_structure(reordered))
+
     def test_capture_uses_verified_tls_and_one_explicit_snapshot_transaction(self):
         from unittest.mock import MagicMock
         conn=MagicMock();queries=[]
