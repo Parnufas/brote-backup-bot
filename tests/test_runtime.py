@@ -18,6 +18,9 @@ import storage
 from database import connection_env
 from bot import check_rehearsal
 import bot
+import core
+import database
+import contextlib
 
 
 FIXTURE_CONFIG={'controller_repository':'tester/controller','vault_repository':'tester/vault','source_repository':'tester/application','project_ref':'abcdefghijklmnopqrst','rehearsal':{'ref':'a'*40,'path':'spec.json','sha256':'b'*64}}
@@ -25,9 +28,81 @@ SOURCE=FIXTURE_CONFIG['controller_repository']
 
 class BackupTests(unittest.TestCase):
     def setUp(self):
+        stages=patch.object(core,'_stage','START');stages.start();self.addCleanup(stages.stop)
         self.environment=patch.dict(os.environ,{'BACKUP_CONFIG':json.dumps(FIXTURE_CONFIG),'GITHUB_SHA':'c'*40,'BACKUP_APPROVED_SHA':'c'*40})
         self.environment.start()
         self.addCleanup(self.environment.stop)
+
+    def test_safe_diagnostics_never_echo_server_text(self):
+        cases=[('password authentication failed','PG_AUTHENTICATION'),
+               ('certificate verify failed','PG_TLS_VERIFY'),
+               ('could not translate host name','PG_DNS'),('connection refused','PG_NETWORK'),
+               ('timeout expired','PG_TIMEOUT'),('invalid connection option','PG_CLIENT_CONFIG'),
+               ('permission denied','PG_PERMISSION'),('unrecognized failure','PG_UNKNOWN')]
+        for message,category in cases:
+            with self.subTest(category=category):
+                core.set_stage('PG_CONNECT')
+                error=RuntimeError(message+' password=CANARY_SECRET host=CANARY_HOST SQL=CANARY_ROW')
+                output=core.failure_code(error)
+                self.assertIn('category='+category,output)
+                self.assertNotIn('CANARY',output)
+                self.assertNotIn(message,output)
+        error=RuntimeError('CANARY_SECRET');error.sqlstate='42501'
+        self.assertIn('category=PG_PERMISSION sqlstate=42501',core.failure_code(error))
+        error.sqlstate='CANARY_SECRET'
+        self.assertIn('sqlstate=NONE',core.failure_code(error))
+
+    def test_dump_failure_is_classified_without_echoing_stderr(self):
+        core.set_stage('PG_DUMP')
+        result=Mock(returncode=1,stderr=b'pg_dump: permission denied CANARY_ROW',stdout=b'')
+        with patch.object(core.subprocess,'run',return_value=result):
+            with self.assertRaises(core.SafeFailure) as raised:core.run(['docker','fixture'])
+        self.assertIn('category=PG_PERMISSION',core.failure_code(raised.exception))
+        self.assertNotIn('CANARY',str(raised.exception))
+
+    def test_capture_uses_verified_tls_and_one_explicit_snapshot_transaction(self):
+        from unittest.mock import MagicMock
+        conn=MagicMock();queries=[]
+        def execute(query):
+            queries.append(query);cursor=MagicMock();cursor.fetchall.return_value=[]
+            value={'SHOW transaction_isolation':'repeatable read','SHOW transaction_read_only':'on',
+                   'SHOW server_version_num':'170011','select count(*) from pg_foreign_table':0,
+                   'select pg_export_snapshot()':'fixture-snapshot',database.STRUCTURE:{}}.get(query)
+            cursor.fetchone.return_value=(value,);return cursor
+        conn.execute.side_effect=execute
+        conn.__enter__.return_value=conn
+        env={'PGHOST':'db.abcdefghijklmnopqrst.supabase.co','PGUSER':'postgres','PGPASSWORD':'synthetic',
+             'PGDATABASE':'postgres','PGSSLROOTCERT':'/etc/ssl/certs/ca-certificates.crt'}
+        with tempfile.TemporaryDirectory() as scratch,patch.object(database,'connection_env',return_value=env), \
+                patch.object(database.psycopg,'connect',return_value=conn) as connect,patch.object(database,'run') as dump:
+            database.capture(scratch)
+            self.assertTrue(connect.call_args.kwargs['autocommit'])
+            self.assertEqual(connect.call_args.kwargs['sslmode'],'verify-full')
+            self.assertEqual(queries[0],'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            self.assertIn('--snapshot=fixture-snapshot',dump.call_args.args[0])
+
+    def test_bad_host_format_rejected_without_network(self):
+        env={'PGHOST':'postgresql://CANARY_HOST/postgres','PGUSER':'postgres','PGPASSWORD':'synthetic','PGDATABASE':'postgres'}
+        with patch.dict(os.environ,env),self.assertRaises(RuntimeError):connection_env()
+
+    def test_api_error_category_contains_no_request_details(self):
+        core.set_stage('HEALTH_NOTIFY')
+        self.assertIn('category=API_FORBIDDEN',core.failure_code(RuntimeError('GitHub POST failed (403)')))
+        output=core.failure_code(RuntimeError('CANARY_TOKEN https://CANARY_HOST/private'))
+        self.assertIn('category=UNCLASSIFIED',output)
+        self.assertNotIn('CANARY',output)
+
+    def test_health_reports_absence_of_valid_backup_explicitly(self):
+        source=Mock();vault=Mock()
+        with tempfile.TemporaryDirectory() as root,patch.dict(os.environ,{
+                'GITHUB_TOKEN':'synthetic','BACKUP_VAULT_TOKEN':'synthetic','GITHUB_RUN_ID':'1',
+                'GITHUB_STEP_SUMMARY':root+'/summary'}), \
+                patch.object(bot,'GitHub',side_effect=[source,vault]),patch.object(bot,'guard'), \
+                patch.object(bot,'records',return_value=[]),patch.object(bot,'set_issue'), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(core.SafeFailure) as result:bot.monitor()
+            self.assertEqual(result.exception.category,'NO_VALID_BACKUP')
+            self.assertIn('category=NO_VALID_BACKUP',output.getvalue())
 
     def test_encrypted_roundtrip_and_wrong_password(self):
         with tempfile.TemporaryDirectory() as scratch:

@@ -9,7 +9,7 @@ import uuid
 
 import psycopg
 from psycopg import sql
-from core import run, write_json
+from core import run, write_json, set_stage
 from settings import config
 
 # Updated deliberately, never selected by workflow_dispatch or PR code.
@@ -87,6 +87,8 @@ def connection_env():
     for key in ('PGHOST', 'PGUSER', 'PGPASSWORD', 'PGDATABASE'):
         if not env.get(key):
             raise RuntimeError('Missing PostgreSQL secret: ' + key)
+    if any(c.isspace() for c in env['PGHOST']) or any(c in env['PGHOST'] for c in '/:@'):
+        raise RuntimeError('PostgreSQL host must be a hostname only')
     project = config()['project_ref']
     if project not in env['PGHOST'] and project not in env['PGUSER']:
         raise RuntimeError('Connection must identify the configured project')
@@ -101,15 +103,23 @@ def connection_env():
 
 def capture(destination):
     destination = Path(destination)
+    set_stage('PG_CONFIG')
     env = connection_env()
     params = {k[2:].lower(): env[k] for k in ('PGHOST', 'PGUSER', 'PGPASSWORD', 'PGDATABASE')}
     params['dbname'] = params.pop('database')
     params.update(port=5432, sslmode='verify-full', sslrootcert=env['PGSSLROOTCERT'], connect_timeout=30)
-    with psycopg.connect(**params) as conn:
+    set_stage('PG_CONNECT')
+    with psycopg.connect(**params, autocommit=True) as conn:
+        set_stage('PG_TRANSACTION')
         conn.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         conn.execute("SET LOCAL timezone='UTC'")
         conn.execute("SET LOCAL search_path=pg_catalog")
         conn.execute("SET LOCAL statement_timeout='30min'")
+        isolation = conn.execute('SHOW transaction_isolation').fetchone()[0]
+        read_only = conn.execute('SHOW transaction_read_only').fetchone()[0]
+        if isolation != 'repeatable read' or read_only != 'on':
+            raise RuntimeError('Snapshot transaction must be repeatable read and read only')
+        set_stage('PG_CATALOG')
         version = conn.execute('SHOW server_version_num').fetchone()[0]
         if int(version) // 10000 != 17:
             raise RuntimeError('Server major differs from reviewed PostgreSQL 17 image')
@@ -120,6 +130,7 @@ def capture(destination):
         write_json(destination / 'roles.json', roles)  # Deliberately no password hashes.
         tables = conn.execute(TABLES).fetchall()
         fingerprints = {}
+        set_stage('PG_ROWS')
         for schema, table in tables:
             h = hashlib.sha256()
             count = 0
@@ -129,6 +140,7 @@ def capture(destination):
                     h.update((row + '\n').encode())
                     count += 1
             fingerprints[f'{schema}.{table}'] = {'rows': count, 'sha256': h.hexdigest()}
+        set_stage('PG_SCHEMA')
         structure = normalize_structure(conn.execute(STRUCTURE).fetchone()[0])
         # The same exported snapshot backs both the dump and all verification evidence.
         args = DOCKER + ['run', '--rm', '--entrypoint', 'pg_dump']
@@ -138,10 +150,12 @@ def capture(destination):
                  'type=bind,src=/etc/ssl/certs/ca-certificates.crt,dst=/run/ca.pem,readonly',
                  IMAGE, '--format=custom', '--snapshot=' + snapshot, '--no-publications', '--no-subscriptions']
         with open(destination / 'database.dump', 'wb') as output:
+            set_stage('PG_DUMP')
             run(args, env=env, output=output)
         write_json(destination / 'database.json', {'server_version_num': version,
                     'tables': tables, 'fingerprints': fingerprints, 'structure': structure})
         # Inventory from exactly the database snapshot that was dumped.
+        set_stage('PG_STORAGE_CATALOG')
         objects = conn.execute('select bucket_id,name,metadata,version from storage.objects order by bucket_id,name').fetchall()
         buckets = conn.execute('select to_jsonb(b) from storage.buckets b order by id').fetchall()
         write_json(destination / 'storage.json', {'buckets': [b[0] for b in buckets],
