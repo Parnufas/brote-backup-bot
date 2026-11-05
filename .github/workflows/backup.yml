@@ -1,0 +1,82 @@
+name: Brote Backup Bot
+run-name: Brote Backup Bot · ${{ inputs.operation || github.event.schedule }}
+on:
+  schedule:
+    - cron: '17 2 * * *'
+    - cron: '47 6 * * *'
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Copia diaria, ensayo previo a migración o repetir restauración'
+        type: choice
+        default: daily
+        options: [daily, pre-migration, restore-latest]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brote-backup-vault
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    if: >-
+      github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA &&
+      (github.event_name == 'workflow_dispatch' || github.event.schedule == '17 2 * * *')
+    runs-on: ubuntu-24.04
+    environment: backup-production
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install reviewed backup dependencies (no production secrets)
+        run: python3 -m pip install --requirement runtime/requirements.txt
+      - name: Capture, encrypt, persist, download and restore in isolation
+        run: python3 runtime/bot.py backup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BACKUP_CONFIG: ${{ secrets.BACKUP_CONFIG }}
+          BACKUP_APPROVED_SHA: ${{ vars.BACKUP_APPROVED_SHA }}
+          BACKUP_SOURCE_READ_TOKEN: ${{ secrets.BACKUP_SOURCE_READ_TOKEN }}
+          BACKUP_MODE: ${{ inputs.operation || 'daily' }}
+          BACKUP_VAULT_TOKEN: ${{ secrets.BACKUP_VAULT_TOKEN }}
+          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+          PGHOST: ${{ secrets.BACKUP_PGHOST }}
+          PGUSER: ${{ secrets.BACKUP_PGUSER }}
+          PGPASSWORD: ${{ secrets.BACKUP_PGPASSWORD }}
+          PGDATABASE: postgres
+          PGPORT: '5432'
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.BACKUP_STORAGE_SERVICE_ROLE_KEY }}
+      - name: Remove disposable PostgreSQL after failure or cancellation
+        if: always()
+        run: |
+          docker ps -aq --filter 'name=brote-restore-' | xargs -r docker rm -f >/dev/null
+          find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'brote-*' -exec rm -rf -- {} +
+
+  health:
+    needs: backup
+    if: >-
+      always() && github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA
+    runs-on: ubuntu-24.04
+    environment: backup-monitor
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install reviewed dependencies (no database secrets)
+        run: python3 -m pip install --requirement runtime/requirements.txt
+      - name: Check freshness and maintain status and failure notification
+        run: python3 runtime/bot.py monitor
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BACKUP_CONFIG: ${{ secrets.BACKUP_CONFIG }}
+          BACKUP_APPROVED_SHA: ${{ vars.BACKUP_APPROVED_SHA }}
+          BACKUP_VAULT_TOKEN: ${{ secrets.BACKUP_MONITOR_TOKEN }}
+          BACKUP_JOB_RESULT: ${{ needs.backup.result == 'skipped' && 'success' || needs.backup.result }}

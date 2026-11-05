@@ -1,0 +1,20 @@
+name: Public scheduler heartbeat
+on:
+  schedule:
+    - cron: '23 12 1 * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  heartbeat:
+    if: github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - run: python3 runtime/heartbeat.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BACKUP_APPROVED_SHA: ${{ vars.BACKUP_APPROVED_SHA }}
