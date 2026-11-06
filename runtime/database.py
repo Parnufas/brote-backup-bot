@@ -271,7 +271,7 @@ class IsolatedPostgres:
             with output.open('wb') as f:
                 run(DOCKER + ['exec','-i',self.name,'psql','-X','-h','/tmp','-U','postgres',
                              '-v','ON_ERROR_STOP=1','-Atq'],
-                    data=("SET timezone='UTC';\n" + query + ';\n').encode(), output=f)
+                    data=("SET timezone='UTC'; SET search_path=pg_catalog;\n" + query + ';\n').encode(), output=f)
             # COPY text escapes backslashes and control characters; decode before hashing.
             h = hashlib.sha256()
             count = 0
