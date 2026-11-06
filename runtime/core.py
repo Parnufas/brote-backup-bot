@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from settings import config, controller_repo, vault_repo
+from settings import config, controller_repo, profile_id, vault_repo
 CHUNK_SIZE = 512 * 1024 * 1024
 MAX_BYTES = 4 * 1024 * 1024 * 1024
 
@@ -37,7 +37,7 @@ def set_stage(value):
     global _stage
     if value not in STAGES:raise ValueError('Unknown diagnostic stage')
     _stage = value
-    print('Brote Backup Bot: stage=' + value, flush=True)
+    print('Backup Bot: stage=' + value, flush=True)
 
 
 class SafeFailure(RuntimeError):
@@ -78,7 +78,7 @@ def failure_code(error):
                     pg_category(message,state) if _stage.startswith('PG_') else
                     {'401':'API_AUTHENTICATION','403':'API_FORBIDDEN','404':'API_NOT_FOUND',
                      '429':'API_RATE_LIMIT'}.get(api[1],'API_FAILED') if api else 'UNCLASSIFIED')
-    return f'BROTE_BACKUP stage={_stage} category={category} sqlstate={state}'
+    return f'BACKUP_BOT stage={_stage} category={category} sqlstate={state}'
 
 
 def now():
@@ -244,7 +244,7 @@ def decrypt(encrypted, destination, work, password):
 def publish(vault, encrypted, work, metadata):
     if encrypted.stat().st_size > MAX_BYTES:
         raise RuntimeError("Backup exceeds 4 GiB; provision a reviewed object-store adapter")
-    tag = "brote-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+    tag = profile_id() + "-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
     release = vault.call(f"repos/{vault_repo()}/releases", "POST", {
         "tag_name": tag, "target_commitish": "main", "name": tag,
         "body": "Encrypted backup. Valid only when validation.json exists and is fresh.",
@@ -306,8 +306,7 @@ def retention_keep(records, current):
                 seen.add(key)
     for record in records:
         age = current - dt.datetime.fromisoformat(record["created_at"].replace("Z", "+00:00"))
-        # A failed drill is not authorization to discard the only encrypted copy.
-        # Keep unvalidated copies private until the owner explicitly reviews them.
-        if not record.get('valid') or record.get("pinned") or age < dt.timedelta(days=7) or (record.get("pre_migration") and age < dt.timedelta(days=30)):
+        if (not record.get('valid') or record.get("pinned") or age < dt.timedelta(days=7)
+                or (record.get("pre_migration") and age < dt.timedelta(days=30))):
             keep.add(record["id"])
     return keep

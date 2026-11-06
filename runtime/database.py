@@ -4,17 +4,17 @@ import json
 import os
 from pathlib import Path
 import re
-import time
-import uuid
 import copy
 import ssl
 import tempfile
+import time
+import uuid
 from contextlib import contextmanager
 
 import psycopg
 from psycopg import sql
 from core import run, write_json, set_stage, SafeFailure
-from settings import config
+from settings import config, profile_id
 
 # Updated deliberately, never selected by workflow_dispatch or PR code.
 IMAGE = "supabase/postgres:17.6.1.136@sha256:5a4314708484bec672de2c09653a5c01fb1c84a998564ac231b0325e2238ed5b"
@@ -77,9 +77,8 @@ def canonical(value):
 
 def normalize_structure(value):
     value = copy.deepcopy(value)
-    # attnum/ordinal_position includes holes left by DROP COLUMN. A logical
-    # dump recreates visible columns densely. Preserve their relative order,
-    # not unobservable historical storage slots; keep every other attribute.
+    # Logical dumps recreate visible columns densely; dropped columns leave
+    # physical ordinal gaps that are not preserved by restore.
     groups = {}
     for column in value.get('columns') or []:
         groups.setdefault((column['table_schema'],column['table_name']),[]).append(column)
@@ -94,20 +93,16 @@ def normalize_structure(value):
     return value
 
 
-def row_query(schema, table):
-    return f'SELECT to_jsonb(t)::text FROM ONLY {ident(schema)}.{ident(table)} t ORDER BY to_jsonb(t)::text COLLATE "C"'
-
-
 @contextmanager
 def postgres_ca():
-    """Project CA is ephemeral, outside the backup payload, and never logged."""
     set_stage('PG_CONFIG')
     pem = os.environ.get('BACKUP_PG_CA_PEM','').strip()
-    if not pem:raise SafeFailure('PG_CA_MISSING')
+    if not pem:
+        raise SafeFailure('PG_CA_MISSING')
     if len(pem) > 131072 or not re.fullmatch(
             r'(?:-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----\s*)+',pem):
         raise SafeFailure('PG_CA_INVALID')
-    with tempfile.TemporaryDirectory(prefix='brote-ca-',dir=os.environ.get('RUNNER_TEMP')) as directory:
+    with tempfile.TemporaryDirectory(prefix=profile_id() + '-ca-',dir=os.environ.get('RUNNER_TEMP')) as directory:
         path = Path(directory) / 'root-ca.pem'
         with open(path,'x',opener=lambda p,f:os.open(p,f,0o600)) as output:
             output.write(pem+'\n')
@@ -116,6 +111,10 @@ def postgres_ca():
         except (ssl.SSLError,ValueError):
             raise SafeFailure('PG_CA_INVALID') from None
         yield path
+
+
+def row_query(schema, table):
+    return f'SELECT to_jsonb(t)::text FROM ONLY {ident(schema)}.{ident(table)} t ORDER BY to_jsonb(t)::text COLLATE "C"'
 
 
 def connection_env(ca_path):
@@ -132,12 +131,16 @@ def connection_env(ca_path):
         raise RuntimeError('Unexpected PostgreSQL host')
     if env.get('PGPORT', '5432') != '5432' or env['PGDATABASE'] != 'postgres':
         raise RuntimeError('Use direct connection or session pooler on port 5432')
-    env.update(PGSSLMODE='verify-full', PGSSLROOTCERT=str(Path(ca_path).resolve(strict=True)),
+    ca_path = Path(ca_path).resolve(strict=True)
+    if not ca_path.is_file():
+        raise RuntimeError('PostgreSQL CA file is unavailable')
+    env.update(PGSSLMODE='verify-full', PGSSLROOTCERT=str(ca_path),
                PGCONNECT_TIMEOUT='30', PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=1800000 -c timezone=UTC')
     return env
 
 
 def dump_args(snapshot, env):
+    """Build the same verified pg_dump invocation used by production and TLS CI."""
     args = DOCKER + ['run','--rm','--entrypoint','pg_dump']
     for name in ('PGHOST','PGUSER','PGPASSWORD','PGDATABASE','PGSSLMODE','PGCONNECT_TIMEOUT','PGOPTIONS'):
         args += ['-e',name]
@@ -180,7 +183,7 @@ def capture(destination, ca_path):
         for schema, table in tables:
             h = hashlib.sha256()
             count = 0
-            with conn.cursor(name='brote_' + uuid.uuid4().hex) as cursor:
+            with conn.cursor(name=profile_id() + '_' + uuid.uuid4().hex) as cursor:
                 cursor.execute(row_query(schema, table))
                 for (row,) in cursor:
                     h.update((row + '\n').encode())
@@ -206,16 +209,16 @@ def capture(destination, ca_path):
 
 class IsolatedPostgres:
     def __init__(self):
-        self.name = 'brote-restore-' + uuid.uuid4().hex
+        self.name = profile_id() + '-restore-' + uuid.uuid4().hex
 
     def __enter__(self):
         # No ports, no network, no production credentials; bypass all Supabase init scripts.
         preload = 'pg_cron' if IMAGE.startswith('supabase/') else ''
-        command = ('mkdir /tmp/brote-pg; chown postgres:postgres /tmp/brote-pg; '
+        command = ('mkdir /tmp/backup-pg; chown postgres:postgres /tmp/backup-pg; '
                    'if command -v su-exec >/dev/null; then demote=(su-exec postgres); '
                    'else demote=(runuser -u postgres --); fi; '
-                   '"${demote[@]}" initdb -D /tmp/brote-pg -U postgres --auth=trust >/dev/null; '
-                   'exec "${demote[@]}" postgres -D /tmp/brote-pg '
+                   '"${demote[@]}" initdb -D /tmp/backup-pg -U postgres --auth=trust >/dev/null; '
+                   'exec "${demote[@]}" postgres -D /tmp/backup-pg '
                    "-c listen_addresses='' -c unix_socket_directories=/tmp "
                    f"-c shared_preload_libraries='{preload}' -c cron.database_name=postgres -c cron.launch_active_jobs=off")
         run(DOCKER + ['run','-d','--name',self.name,'--network=none','--user=0',

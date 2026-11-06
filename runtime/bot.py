@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Brote Backup Bot: secrets only on protected main, restore only in Docker."""
+"""Backup controller: secrets only on protected main, restore only in Docker."""
 import base64
 import datetime as dt
 import hashlib
@@ -16,7 +16,7 @@ from core import (GitHub,
 from database import IMAGE, DOCKER, capture, IsolatedPostgres, postgres_ca
 from storage import capture_bytes, verify_bytes
 from core import run, set_stage, failure_code, SafeFailure
-from settings import config, controller_repo, vault_repo, source_repo, mask_private_config
+from settings import config, controller_repo, profile_id, vault_repo, source_repo, mask_private_config
 
 
 def clients():
@@ -83,18 +83,20 @@ def public_summary(message):
 
 def backup():
     set_stage('CONTROL')
-    print('Brote Backup Bot: checking protected main and private vault',flush=True)
+    print('Backup Bot: checking protected main and private vault',flush=True)
     controller, vault = clients()
     mode = os.environ.get('BACKUP_MODE', 'daily')
     if mode not in {'daily','pre-migration','restore-latest'}:
         raise RuntimeError('Invalid backup operation')
     if mode == 'pre-migration':
+        if not config().get('rehearsal'):
+            raise RuntimeError('This profile has no reviewed migration rehearsal')
         source = GitHub(os.environ.get('BACKUP_SOURCE_READ_TOKEN'))
         spec = load_rehearsal(source)
         check_rehearsal(source, spec)
     password = os.environ.get('BACKUP_ENCRYPTION_PASSWORD', '')
     run(DOCKER + ['pull',IMAGE])
-    with tempfile.TemporaryDirectory(prefix='brote-', dir=os.environ.get('RUNNER_TEMP')) as scratch:
+    with tempfile.TemporaryDirectory(prefix=profile_id() + '-backup-', dir=os.environ.get('RUNNER_TEMP')) as scratch:
         work = Path(scratch)
         if mode == 'restore-latest':
             release = latest_valid(vault)[0]
@@ -102,13 +104,13 @@ def backup():
             data = work / 'data'
             data.mkdir(mode=0o700)
             started = now()
-            print('Brote Backup Bot: capturing consistent PostgreSQL snapshot',flush=True)
+            print('Backup Bot: capturing consistent PostgreSQL snapshot',flush=True)
             with postgres_ca() as ca_path:
                 version = capture(data, ca_path)
-                print('Brote Backup Bot: capturing and reconciling Storage bytes',flush=True)
+                print('Backup Bot: capturing and reconciling Storage bytes',flush=True)
                 set_stage('STORAGE_BYTES')
                 object_count, storage_bytes = capture_bytes(data, ca_path)
-            print('Brote Backup Bot: encrypting and publishing private backup',flush=True)
+            print('Backup Bot: encrypting and publishing private backup',flush=True)
             set_stage('ENCRYPT')
             encrypted = encrypt(data, work, password)
             metadata = {'backup_started_at':started,'backup_completed_at':now(),
@@ -119,7 +121,7 @@ def backup():
                         'run_url':f"https://github.com/{controller_repo()}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
             set_stage('PUBLISH')
             release = publish(vault, encrypted, work, metadata)
-        print('Brote Backup Bot: downloading and verifying stored ciphertext',flush=True)
+        print('Backup Bot: downloading and verifying stored ciphertext',flush=True)
         set_stage('DOWNLOAD')
         encrypted, manifest = fetch_bundle(vault, release, work)
         set_stage('DECRYPT')
@@ -127,11 +129,11 @@ def backup():
         object_count = verify_bytes(work / 'restored')
         set_stage('RESTORE')
         with IsolatedPostgres() as database:
-            print('Brote Backup Bot: restoring and comparing structure and data in isolation',flush=True)
+            print('Backup Bot: restoring and comparing structure and data in isolation',flush=True)
             tables = database.restore(work / 'restored')
             rehearsal = None
             if mode == 'pre-migration':
-                print('Brote Backup Bot: rehearsing approved migration in isolation',flush=True)
+                print('Backup Bot: rehearsing approved migration in isolation',flush=True)
                 before_rehearsal(database, work / 'restored')
                 set_stage('REHEARSAL')
                 rehearsal = rehearse(source, database, work, spec)
@@ -147,7 +149,7 @@ def backup():
         else:
             path = work / 'validation.json'
         write_json(path, validation)
-        print('Brote Backup Bot: persisting successful validation',flush=True)
+        print('Backup Bot: persisting successful validation',flush=True)
         set_stage('VALIDATION')
         vault.upload(release, path)
         # Only prune after a full successful round-trip. Refuse public vault again before deletes.
@@ -162,7 +164,7 @@ def records(vault):
     releases = vault.pages(f'repos/{vault_repo()}/releases')
     result = []
     for release in releases:
-        if not re.fullmatch(r'brote-\d{8}T\d{6}Z-\d+-\d+', release['tag_name']):
+        if not re.fullmatch(re.escape(profile_id()) + r'-\d{8}T\d{6}Z-\d+-\d+', release['tag_name']):
             continue
         assets = vault.pages(f"repos/{vault_repo()}/releases/{release['id']}/assets")
         by_name = {a['name']:a for a in assets}
@@ -243,8 +245,9 @@ def monitor():
     run_url = f"https://github.com/{controller_repo()}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
     body += f'\n[Última comprobación]({run_url})\n'
     set_stage('HEALTH_NOTIFY')
-    set_issue(vault,'Brote Backup Bot · estado',body)
-    set_issue(vault,'Brote Backup Bot · fallo de backup o restauración',body,
+    title = 'Brote Backup Bot' if profile_id() == 'brote' else 'Backup Bot · ' + profile_id().capitalize()
+    set_issue(vault,title + ' · estado',body)
+    set_issue(vault,title + ' · fallo de backup o restauración',body,
               state='open' if failure else 'closed')
     public_summary('Health check failed. See the private vault.' if failure else 'Health check passed. Detailed status is private.')
     if failure:
@@ -263,5 +266,5 @@ if __name__ == '__main__':
         # Never emit exception text / traceback: responses can contain PII or credentials.
         # Our exact RuntimeError instances contain only fixed, sanitized diagnostics.
         # Public logs must not include even fragments of private exception data.
-        print('::error::Brote Backup Bot failed. Inspect the failed step and the recovery runbook; no sensitive output retained.')
+        print('::error::Backup Bot failed. Inspect the failed step and the recovery runbook; no sensitive output retained.')
         sys.exit(1)
