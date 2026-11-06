@@ -139,6 +139,17 @@ def connection_env(ca_path):
     return env
 
 
+def dump_args(snapshot, env):
+    """Build the same verified pg_dump invocation used by production and TLS CI."""
+    args = DOCKER + ['run','--rm','--entrypoint','pg_dump']
+    for name in ('PGHOST','PGUSER','PGPASSWORD','PGDATABASE','PGSSLMODE','PGCONNECT_TIMEOUT','PGOPTIONS'):
+        args += ['-e',name]
+    args += ['-e','PGSSLROOTCERT=/run/ca.pem','--mount',
+             f"type=bind,src={env['PGSSLROOTCERT']},dst=/run/ca.pem,readonly",
+             IMAGE,'--format=custom','--snapshot='+snapshot,'--no-publications','--no-subscriptions']
+    return args
+
+
 def capture(destination, ca_path):
     destination = Path(destination)
     set_stage('PG_CONFIG')
@@ -181,12 +192,7 @@ def capture(destination, ca_path):
         set_stage('PG_SCHEMA')
         structure = normalize_structure(conn.execute(STRUCTURE).fetchone()[0])
         # The same exported snapshot backs both the dump and all verification evidence.
-        args = DOCKER + ['run','--rm','--entrypoint','pg_dump']
-        for name in ('PGHOST','PGUSER','PGPASSWORD','PGDATABASE','PGSSLMODE','PGCONNECT_TIMEOUT','PGOPTIONS'):
-            args += ['-e',name]
-        args += ['-e','PGSSLROOTCERT=/run/ca.pem','--mount',
-                 f"type=bind,src={env['PGSSLROOTCERT']},dst=/run/ca.pem,readonly",
-                 IMAGE,'--format=custom','--snapshot='+snapshot,'--no-publications','--no-subscriptions']
+        args = dump_args(snapshot, env)
         with open(destination / 'database.dump', 'wb') as output:
             set_stage('PG_DUMP')
             run(args, env=env, output=output)
