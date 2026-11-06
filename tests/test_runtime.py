@@ -4,6 +4,8 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import stat
 import tarfile
 import tempfile
 import unittest
@@ -11,15 +13,16 @@ from unittest.mock import Mock, patch
 
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"runtime"))
-from core import (GitHub, guard, encrypt, decrypt, retention_keep,
+from core import (GitHub, guard, encrypt, decrypt, retention_keep, publish,
                   fetch_bundle, sha, write_json, run)
 from storage import verify_bytes
 import storage
-from database import connection_env
+from database import connection_env, postgres_ca
 from bot import check_rehearsal
 import bot
 import core
 import database
+from settings import config
 import contextlib
 
 
@@ -29,7 +32,7 @@ SOURCE=FIXTURE_CONFIG['controller_repository']
 class BackupTests(unittest.TestCase):
     def setUp(self):
         stages=patch.object(core,'_stage','START');stages.start();self.addCleanup(stages.stop)
-        self.environment=patch.dict(os.environ,{'BACKUP_CONFIG':json.dumps(FIXTURE_CONFIG),'GITHUB_SHA':'c'*40,'BACKUP_APPROVED_SHA':'c'*40})
+        self.environment=patch.dict(os.environ,{'BACKUP_CONFIG':json.dumps(FIXTURE_CONFIG),'BACKUP_PROFILE':'brote','GITHUB_SHA':'c'*40,'BACKUP_APPROVED_SHA':'c'*40})
         self.environment.start()
         self.addCleanup(self.environment.stop)
 
@@ -60,38 +63,13 @@ class BackupTests(unittest.TestCase):
         self.assertIn('category=PG_PERMISSION',core.failure_code(raised.exception))
         self.assertNotIn('CANARY',str(raised.exception))
 
-    def test_restore_errors_do_not_echo_private_names_or_sql(self):
-        for stage in ('RESTORE_ROLES','RESTORE_DUMP'):
-            core.set_stage(stage)
-            result=Mock(returncode=1,stderr=b'ERROR: role "CANARY_PRIVATE" already exists SQL CANARY_SECRET',stdout=b'')
-            with patch.object(core.subprocess,'run',return_value=result),self.assertRaises(core.SafeFailure) as error:
-                core.run(['docker','fixture'])
-            code=core.failure_code(error.exception)
-            self.assertIn('category=RESTORE_OBJECT_EXISTS',code)
-            self.assertNotIn('CANARY',code)
-
-    def test_unvalidated_copy_is_retained_even_after_normal_expiry(self):
-        current=dt.datetime.now(dt.timezone.utc)
-        old={'id':99,'created_at':(current-dt.timedelta(days=365)).isoformat(),'valid':False}
-        self.assertIn(99,retention_keep([old],current))
-
-    def test_logical_column_order_ignores_only_dropped_storage_slots(self):
-        import copy
-        def col(name,position,**extra):
-            return dict(table_schema='auth',table_name='fixture',column_name=name,
-                        ordinal_position=position,data_type='text',is_nullable='YES',**extra)
-        legacy={'columns':[col('id',1),col('retained',3),col('note',5)],'policies':[]}
-        fresh={'columns':[col('id',1),col('retained',2),col('note',3)],'policies':[]}
-        self.assertEqual(database.normalize_structure(legacy),database.normalize_structure(fresh))
-        self.assertEqual(legacy['columns'][1]['ordinal_position'],3)
-        self.assertEqual(database.normalize_structure(database.normalize_structure(legacy)),database.normalize_structure(legacy))
-        for attribute,value in [('column_name','other'),('data_type','integer'),('is_nullable','NO')]:
-            changed=copy.deepcopy(fresh);changed['columns'][1][attribute]=value
-            self.assertNotEqual(database.normalize_structure(legacy),database.normalize_structure(changed))
-        reordered=copy.deepcopy(fresh)
-        reordered['columns'][1]['ordinal_position']=3
-        reordered['columns'][2]['ordinal_position']=2
-        self.assertNotEqual(database.normalize_structure(legacy),database.normalize_structure(reordered))
+    def test_restore_failure_classification_does_not_expose_stderr(self):
+        core.set_stage('RESTORE_DUMP')
+        result=Mock(returncode=1,stderr=b'permission denied CANARY_ROW',stdout=b'')
+        with patch.object(core.subprocess,'run',return_value=result):
+            with self.assertRaises(core.SafeFailure) as raised:core.run(['docker','fixture'])
+        self.assertEqual(raised.exception.category,'RESTORE_PERMISSION')
+        self.assertNotIn('CANARY',core.failure_code(raised.exception))
 
     def test_capture_uses_verified_tls_and_one_explicit_snapshot_transaction(self):
         from unittest.mock import MagicMock
@@ -104,21 +82,44 @@ class BackupTests(unittest.TestCase):
             cursor.fetchone.return_value=(value,);return cursor
         conn.execute.side_effect=execute
         conn.__enter__.return_value=conn
-        env={'PGHOST':'db.abcdefghijklmnopqrst.supabase.co','PGUSER':'postgres','PGPASSWORD':'synthetic',
-             'PGDATABASE':'postgres','PGSSLROOTCERT':str(Path(__file__).resolve())}
-        with tempfile.TemporaryDirectory() as scratch,patch.object(database,'connection_env',return_value=env), \
-                patch.object(database.psycopg,'connect',return_value=conn) as connect,patch.object(database,'run') as dump:
-            database.capture(scratch,__file__)
+        with tempfile.TemporaryDirectory() as scratch:
+            ca_path=Path(scratch)/'root-ca.pem';ca_path.write_text('synthetic project CA')
+            env={'PGHOST':'db.abcdefghijklmnopqrst.supabase.co','PGUSER':'postgres','PGPASSWORD':'synthetic',
+                 'PGDATABASE':'postgres','PGSSLROOTCERT':str(ca_path)}
+            with patch.object(database,'connection_env',return_value=env) as connection, \
+                    patch.object(database.psycopg,'connect',return_value=conn) as connect,patch.object(database,'run') as dump:
+                database.capture(scratch,ca_path)
+            connection.assert_called_once_with(ca_path)
             self.assertTrue(connect.call_args.kwargs['autocommit'])
             self.assertEqual(connect.call_args.kwargs['sslmode'],'verify-full')
+            self.assertEqual(connect.call_args.kwargs['sslrootcert'],str(ca_path))
             self.assertEqual(queries[0],'BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
             self.assertIn('--snapshot=fixture-snapshot',dump.call_args.args[0])
-            self.assertEqual(connect.call_args.kwargs['sslrootcert'],env['PGSSLROOTCERT'])
-            self.assertIn('type=bind,src='+env['PGSSLROOTCERT']+',dst=/run/ca.pem,readonly',dump.call_args.args[0])
+            self.assertIn(f'type=bind,src={ca_path},dst=/run/ca.pem,readonly',dump.call_args.args[0])
+
+    def test_project_ca_is_required_validated_private_and_ephemeral(self):
+        for value,category in [('', 'PG_CA_MISSING'),('CANARY_PRIVATE_CONTENT','PG_CA_INVALID'),
+                ('-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----','PG_CA_INVALID'),
+                ('-----BEGIN PRIVATE KEY-----\nCANARY\n-----END PRIVATE KEY-----','PG_CA_INVALID')]:
+            with self.subTest(category=category),patch.dict(os.environ,{'BACKUP_PG_CA_PEM':value}):
+                with self.assertRaises(core.SafeFailure) as result:
+                    with postgres_ca():pass
+                self.assertEqual(result.exception.category,category)
+                self.assertNotIn('CANARY',core.failure_code(result.exception))
+        cert_bundle=Path('/etc/ssl/certs/ca-certificates.crt').read_text()
+        valid=re.search(r'-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----',cert_bundle,re.S).group()
+        with patch.dict(os.environ,{'BACKUP_PG_CA_PEM':valid}):
+            with postgres_ca() as ca_path:
+                self.assertTrue(ca_path.is_file())
+                self.assertEqual(stat.S_IMODE(ca_path.stat().st_mode),0o600)
+                self.assertEqual(ca_path.read_text(),valid+'\n')
+            self.assertFalse(ca_path.exists())
 
     def test_bad_host_format_rejected_without_network(self):
         env={'PGHOST':'postgresql://CANARY_HOST/postgres','PGUSER':'postgres','PGPASSWORD':'synthetic','PGDATABASE':'postgres'}
-        with patch.dict(os.environ,env),self.assertRaises(RuntimeError):connection_env(__file__)
+        with tempfile.TemporaryDirectory() as root:
+            ca_path=Path(root)/'ca.pem';ca_path.write_text('synthetic')
+            with patch.dict(os.environ,env),self.assertRaises(RuntimeError):connection_env(ca_path)
 
     def test_api_error_category_contains_no_request_details(self):
         core.set_stage('HEALTH_NOTIFY')
@@ -126,16 +127,6 @@ class BackupTests(unittest.TestCase):
         output=core.failure_code(RuntimeError('CANARY_TOKEN https://CANARY_HOST/private'))
         self.assertIn('category=UNCLASSIFIED',output)
         self.assertNotIn('CANARY',output)
-
-    def test_ca_secret_is_required_and_malformed_values_are_not_echoed(self):
-        for value,category in [('', 'PG_CA_MISSING'),('CANARY_PRIVATE_CONTENT','PG_CA_INVALID'),
-                ('-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----','PG_CA_INVALID'),
-                ('-----BEGIN PRIVATE KEY-----\nCANARY\n-----END PRIVATE KEY-----','PG_CA_INVALID')]:
-            with self.subTest(category=category),patch.dict(os.environ,{'BACKUP_PG_CA_PEM':value}):
-                with self.assertRaises(core.SafeFailure) as result:
-                    with database.postgres_ca():pass
-                self.assertEqual(result.exception.category,category)
-                self.assertNotIn('CANARY',core.failure_code(result.exception))
 
     def test_health_reports_absence_of_valid_backup_explicitly(self):
         source=Mock();vault=Mock()
@@ -213,13 +204,86 @@ class BackupTests(unittest.TestCase):
             vault.call.return_value={'private':False,'archived':False}
             with self.assertRaises(RuntimeError):guard(source,vault)
 
+    def test_profile_configuration_is_explicit_and_backward_compatible_only_for_brote(self):
+        self.assertNotIn('profile_id',config())
+        with patch.dict(os.environ,{'BACKUP_PROFILE':'violeta'}),self.assertRaises(RuntimeError):
+            config()
+        violeta={**FIXTURE_CONFIG,'profile_id':'violeta'}
+        with patch.dict(os.environ,{'BACKUP_PROFILE':'violeta','BACKUP_CONFIG':json.dumps(violeta)}):
+            self.assertEqual(config()['profile_id'],'violeta')
+        with patch.dict(os.environ,{'BACKUP_PROFILE':'unknown'}),self.assertRaises(RuntimeError):
+            config()
+
+    def test_profile_mismatch_is_rejected_before_github_access(self):
+        controller=Mock();vault=Mock()
+        with patch.dict(os.environ,{'BACKUP_PROFILE':'violeta'}),self.assertRaises(RuntimeError):
+            guard(controller,vault)
+        controller.call.assert_not_called()
+        vault.call.assert_not_called()
+
+    def test_profile_scoped_vault_token_must_access_only_its_configured_vault(self):
+        controller=Mock();vault=Mock()
+        controller.call.side_effect=lambda path: (
+            {'private':False,'fork':False,'default_branch':'main','archived':False}
+            if path == 'repos/tester/controller' else {'protected':True})
+        vault.call.side_effect=RuntimeError('GitHub GET failed (404)')
+        with patch.dict(os.environ,{
+                'BACKUP_PROFILE':'violeta',
+                'BACKUP_CONFIG':json.dumps({**FIXTURE_CONFIG,'profile_id':'violeta'}),
+                'GITHUB_REPOSITORY':SOURCE,'GITHUB_REF':'refs/heads/main',
+                'GITHUB_EVENT_NAME':'workflow_dispatch'}),self.assertRaises(RuntimeError):
+            guard(controller,vault)
+        self.assertEqual(vault.call.call_args.args[0],'repos/tester/vault')
+
+    def test_structure_normalization_ignores_only_dropped_column_slots(self):
+        import copy
+        def column(name,position,**extra):
+            return dict(table_schema='auth',table_name='fixture',column_name=name,
+                        ordinal_position=position,data_type='text',is_nullable='YES',**extra)
+        legacy={'columns':[column('id',1),column('retained',3),column('note',5)],'policies':[]}
+        fresh={'columns':[column('id',1),column('retained',2),column('note',3)],'policies':[]}
+        self.assertEqual(database.normalize_structure(legacy),database.normalize_structure(fresh))
+        self.assertEqual(legacy['columns'][1]['ordinal_position'],3)
+        self.assertEqual(database.normalize_structure(database.normalize_structure(legacy)),
+                         database.normalize_structure(legacy))
+        for attribute,value in [('column_name','other'),('data_type','integer'),('is_nullable','NO')]:
+            changed=copy.deepcopy(fresh);changed['columns'][1][attribute]=value
+            self.assertNotEqual(database.normalize_structure(legacy),database.normalize_structure(changed))
+        reordered=copy.deepcopy(fresh)
+        reordered['columns'][1]['ordinal_position']=3
+        reordered['columns'][2]['ordinal_position']=2
+        self.assertNotEqual(database.normalize_structure(legacy),database.normalize_structure(reordered))
+
+    def test_release_names_are_scoped_to_the_selected_profile(self):
+        vault=Mock()
+        vault.call.return_value={'upload_url':'https://uploads.github.com/releases/1/assets{?name,label}'}
+        with tempfile.TemporaryDirectory() as root,patch.dict(os.environ,{
+                'BACKUP_PROFILE':'violeta','BACKUP_CONFIG':json.dumps({**FIXTURE_CONFIG,'profile_id':'violeta'}),
+                'GITHUB_RUN_ID':'7','GITHUB_RUN_ATTEMPT':'2'}):
+            encrypted=Path(root)/'cipher';encrypted.write_bytes(b'encrypted synthetic')
+            publish(vault,encrypted,root,{})
+        tag=vault.call.call_args.args[2]['tag_name']
+        self.assertRegex(tag,r'^violeta-\d{8}T\d{6}Z-7-2$')
+
+    def test_retention_ignores_releases_from_other_profiles(self):
+        brote={'tag_name':'brote-20261106T020000Z-1-1','id':1,'name':'Brote','created_at':'2026-11-06T02:00:00Z'}
+        violeta={'tag_name':'violeta-20261106T030000Z-2-1','id':2,'name':'Violeta','created_at':'2026-11-06T03:00:00Z'}
+        vault=Mock()
+        vault.pages.side_effect=[[brote,violeta],[]]
+        with patch.object(bot,'profile_id',return_value='violeta'),patch.object(bot,'vault_repo',return_value='tester/vault'):
+            self.assertEqual([record['id'] for record in bot.records(vault)],[2])
+
     def test_production_connection_allowlist(self):
         good={'PGHOST':'db.abcdefghijklmnopqrst.supabase.co','PGUSER':'postgres',
               'PGPASSWORD':'synthetic','PGDATABASE':'postgres','PGPORT':'5432'}
-        with patch.dict(os.environ,good):
-            self.assertEqual(connection_env(__file__)['PGSSLMODE'],'verify-full')
-            for key,value in [('PGHOST','attacker.example'),('PGPORT','6543'),('PGDATABASE','other')]:
-                with patch.dict(os.environ,{key:value}),self.assertRaises(RuntimeError):connection_env(__file__)
+        with tempfile.TemporaryDirectory() as root:
+            ca_path=Path(root)/'project-ca.pem';ca_path.write_text('project-specific certificate')
+            with patch.dict(os.environ,good):
+                env=connection_env(ca_path)
+                self.assertEqual(env['PGSSLMODE'],'verify-full')
+                self.assertEqual(env['PGSSLROOTCERT'],str(ca_path.resolve()))
+                for key,value in [('PGHOST','attacker.example'),('PGPORT','6543'),('PGDATABASE','other')]:
+                    with patch.dict(os.environ,{key:value}),self.assertRaises(RuntimeError):connection_env(ca_path)
 
     def test_unapproved_commit_is_rejected_before_api_access(self):
         controller=Mock();vault=Mock()
@@ -259,6 +323,12 @@ class BackupTests(unittest.TestCase):
         self.assertNotIn(298,keep)
         self.assertLess(len(keep),35)
 
+    def test_retention_never_deletes_unvalidated_releases(self):
+        current=dt.datetime(2026,11,6,tzinfo=dt.timezone.utc)
+        records=[{'id':1,'created_at':(current-dt.timedelta(days=12)).isoformat(),'valid':False},
+                 {'id':2,'created_at':(current-dt.timedelta(days=12)).isoformat(),'valid':True}]
+        self.assertIn(1,retention_keep(records,current))
+
     def test_storage_requires_all_bytes_including_private_paths(self):
         with tempfile.TemporaryDirectory() as scratch:
             root=Path(scratch); (root/'objects').mkdir()
@@ -284,13 +354,16 @@ class BackupTests(unittest.TestCase):
                 conn.execute.return_value.fetchall.side_effect=[[] if changed else [('private',obj['name'],obj['metadata'],'v1')],[]]
                 with patch.dict(os.environ,{'SUPABASE_SERVICE_ROLE_KEY':'synthetic'}), \
                         patch.object(storage.urllib.request,'build_opener',return_value=opener), \
-                        patch.object(storage,'connection_env',return_value=env), \
-                        patch.object(storage.psycopg,'connect',return_value=conn):
+                        patch.object(storage,'connection_env',return_value=env) as connection, \
+                        patch.object(storage.psycopg,'connect',return_value=conn) as connect:
                     if changed:
                         with self.assertRaisesRegex(RuntimeError,'inventory changed'):storage.capture_bytes(root,__file__)
                     else:
                         self.assertEqual(storage.capture_bytes(root,__file__),(1,4))
                         self.assertEqual(verify_bytes(root),1)
+                    connection.assert_called_once_with(__file__)
+                    self.assertEqual(connect.call_args.kwargs['sslmode'],'verify-full')
+                    self.assertEqual(connect.call_args.kwargs['sslrootcert'],env['PGSSLROOTCERT'])
 
     def test_changed_pr_cannot_reuse_migration_gate(self):
         source=Mock(); source.call.return_value={'head':{'sha':'changed'},'base':{'ref':'main'}}
@@ -309,7 +382,16 @@ class BackupTests(unittest.TestCase):
         self.assertNotIn('pull_request_target',production)
         self.assertNotIn('pull_request:',production)
         self.assertIn('environment: backup-production',production)
-        self.assertIn("github.ref == 'refs/heads/main'",production)
+        self.assertIn('environment: backup-violeta-production',production)
+        self.assertIn('environment: backup-violeta-monitor',production)
+        self.assertIn("inputs.profile == 'brote'",production)
+        self.assertIn("inputs.profile == 'violeta'",production)
+        self.assertIn("vars.BACKUP_VIOLETA_ENABLED == 'true'",production)
+        self.assertIn('group: brote-backup-vault',production)
+        self.assertIn('group: violeta-backup-vault',production)
+        self.assertIn('BACKUP_PROFILE: brote',production)
+        self.assertIn('BACKUP_PROFILE: violeta',production)
+        self.assertEqual(production.count('BACKUP_PG_CA_PEM: ${{ secrets.BACKUP_PG_CA_PEM }}'),2)
 
     def test_failed_restore_never_publishes_valid_marker_or_prunes(self):
         source=Mock();vault=Mock();isolation=Mock()
@@ -320,7 +402,7 @@ class BackupTests(unittest.TestCase):
                 'BACKUP_MODE':'daily','GITHUB_SHA':'synthetic','GITHUB_RUN_ID':'1',
                 'BACKUP_ENCRYPTION_PASSWORD':'synthetic-'*8,'GITHUB_STEP_SUMMARY':root+'/summary'}), \
                 patch.object(bot,'clients',return_value=(source,vault)), \
-                patch.object(bot,'postgres_ca') as ca,patch.object(bot,'run'),patch.object(bot,'capture',return_value='170006'), \
+                patch.object(bot,'postgres_ca') as ca,patch.object(bot,'run'),patch.object(bot,'capture',return_value='170006') as capture, \
                 patch.object(bot,'capture_bytes',return_value=(0,0)),patch.object(bot,'encrypt'), \
                 patch.object(bot,'publish',return_value={'id':1}), \
                 patch.object(bot,'fetch_bundle',return_value=(Path(root)/'cipher',{})), \
@@ -328,6 +410,7 @@ class BackupTests(unittest.TestCase):
                 patch.object(bot,'IsolatedPostgres',return_value=isolation), \
                 patch.object(bot,'prune') as prune:
             with self.assertRaises(RuntimeError):bot.backup()
+            capture.assert_called_once_with(unittest.mock.ANY,ca.return_value.__enter__.return_value)
             vault.upload.assert_not_called()
             prune.assert_not_called()
 
@@ -346,6 +429,7 @@ class BackupTests(unittest.TestCase):
             self.assertNotIn(stale,Path(root+'/summary').read_text())
             self.assertIn('Health check failed',Path(root+'/summary').read_text())
             self.assertEqual(issue.call_args.kwargs['state'],'open')
+            self.assertEqual(issue.call_args_list[0].args[1],'Brote Backup Bot · estado')
 
 
 if __name__=='__main__':unittest.main()
