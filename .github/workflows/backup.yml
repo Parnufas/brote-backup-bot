@@ -1,11 +1,18 @@
-name: Brote Backup Bot
-run-name: Brote Backup Bot · ${{ inputs.operation || github.event.schedule }}
+name: Backup Bot
+run-name: Backup Bot · ${{ inputs.profile || github.event.schedule }}
 on:
   schedule:
     - cron: '17 2 * * *'
     - cron: '47 6 * * *'
+    - cron: '17 3 * * *'
+    - cron: '47 7 * * *'
   workflow_dispatch:
     inputs:
+      profile:
+        description: 'Perfil aislado que se ejecutará'
+        type: choice
+        default: brote
+        options: [brote, violeta]
       operation:
         description: 'Copia diaria, ensayo previo a migración o repetir restauración'
         type: choice
@@ -15,16 +22,16 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: brote-backup-vault
-  cancel-in-progress: false
-
 jobs:
-  backup:
+  backup-brote:
     if: >-
       github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA &&
-      (github.event_name == 'workflow_dispatch' || github.event.schedule == '17 2 * * *')
+      ((github.event_name == 'workflow_dispatch' && inputs.profile == 'brote') ||
+      (github.event_name == 'schedule' && github.event.schedule == '17 2 * * *'))
     runs-on: ubuntu-24.04
+    concurrency:
+      group: brote-backup-vault
+      cancel-in-progress: false
     environment: backup-production
     timeout-minutes: 90
     steps:
@@ -39,6 +46,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BACKUP_CONFIG: ${{ secrets.BACKUP_CONFIG }}
+          BACKUP_PROFILE: brote
           BACKUP_APPROVED_SHA: ${{ vars.BACKUP_APPROVED_SHA }}
           BACKUP_SOURCE_READ_TOKEN: ${{ secrets.BACKUP_SOURCE_READ_TOKEN }}
           BACKUP_MODE: ${{ inputs.operation || 'daily' }}
@@ -55,13 +63,18 @@ jobs:
         if: always()
         run: |
           docker ps -aq --filter 'name=brote-restore-' | xargs -r docker rm -f >/dev/null
-          find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'brote-*' -exec rm -rf -- {} +
+          find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'brote-backup-*' -exec rm -rf -- {} +
 
-  health:
-    needs: backup
+  health-brote:
+    needs: backup-brote
     if: >-
-      always() && github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA
+      always() && github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA &&
+      ((github.event_name == 'workflow_dispatch' && inputs.profile == 'brote') ||
+      (github.event_name == 'schedule' && (github.event.schedule == '17 2 * * *' || github.event.schedule == '47 6 * * *')))
     runs-on: ubuntu-24.04
+    concurrency:
+      group: brote-backup-monitor
+      cancel-in-progress: false
     environment: backup-monitor
     timeout-minutes: 15
     permissions:
@@ -78,6 +91,82 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           BACKUP_CONFIG: ${{ secrets.BACKUP_CONFIG }}
+          BACKUP_PROFILE: brote
           BACKUP_APPROVED_SHA: ${{ vars.BACKUP_APPROVED_SHA }}
           BACKUP_VAULT_TOKEN: ${{ secrets.BACKUP_MONITOR_TOKEN }}
-          BACKUP_JOB_RESULT: ${{ needs.backup.result == 'skipped' && 'success' || needs.backup.result }}
+          BACKUP_JOB_RESULT: ${{ needs.backup-brote.result == 'skipped' && 'success' || needs.backup-brote.result }}
+
+  backup-violeta:
+    if: >-
+      vars.BACKUP_VIOLETA_ENABLED == 'true' &&
+      github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA &&
+      ((github.event_name == 'workflow_dispatch' && inputs.profile == 'violeta') ||
+      (github.event_name == 'schedule' && github.event.schedule == '17 3 * * *'))
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: violeta-backup-vault
+      cancel-in-progress: false
+    environment: backup-violeta-production
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install reviewed backup dependencies (no production secrets)
+        run: python3 -m pip install --requirement runtime/requirements.txt
+      - name: Capture, encrypt, persist, download and restore in isolation
+        run: python3 runtime/bot.py backup
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BACKUP_CONFIG: ${{ secrets.BACKUP_CONFIG }}
+          BACKUP_PROFILE: violeta
+          BACKUP_APPROVED_SHA: ${{ vars.BACKUP_APPROVED_SHA }}
+          BACKUP_SOURCE_READ_TOKEN: ${{ secrets.BACKUP_SOURCE_READ_TOKEN }}
+          BACKUP_MODE: ${{ inputs.operation || 'daily' }}
+          BACKUP_VAULT_TOKEN: ${{ secrets.BACKUP_VAULT_TOKEN }}
+          BACKUP_ENCRYPTION_PASSWORD: ${{ secrets.BACKUP_ENCRYPTION_PASSWORD }}
+          PGHOST: ${{ secrets.BACKUP_PGHOST }}
+          PGUSER: ${{ secrets.BACKUP_PGUSER }}
+          PGPASSWORD: ${{ secrets.BACKUP_PGPASSWORD }}
+          BACKUP_PG_CA_PEM: ${{ secrets.BACKUP_PG_CA_PEM }}
+          PGDATABASE: postgres
+          PGPORT: '5432'
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.BACKUP_STORAGE_SERVICE_ROLE_KEY }}
+      - name: Remove disposable PostgreSQL after failure or cancellation
+        if: always()
+        run: |
+          docker ps -aq --filter 'name=violeta-restore-' | xargs -r docker rm -f >/dev/null
+          find "$RUNNER_TEMP" -maxdepth 1 -type d -name 'violeta-backup-*' -exec rm -rf -- {} +
+
+  health-violeta:
+    needs: backup-violeta
+    if: >-
+      always() && vars.BACKUP_VIOLETA_ENABLED == 'true' &&
+      github.repository == 'Parnufas/brote-backup-bot' && github.ref == 'refs/heads/main' && github.sha == vars.BACKUP_APPROVED_SHA &&
+      ((github.event_name == 'workflow_dispatch' && inputs.profile == 'violeta') ||
+      (github.event_name == 'schedule' && (github.event.schedule == '17 3 * * *' || github.event.schedule == '47 7 * * *')))
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: violeta-backup-monitor
+      cancel-in-progress: false
+    environment: backup-violeta-monitor
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install reviewed dependencies (no database secrets)
+        run: python3 -m pip install --requirement runtime/requirements.txt
+      - name: Check freshness and maintain status and failure notification
+        run: python3 runtime/bot.py monitor
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BACKUP_CONFIG: ${{ secrets.BACKUP_CONFIG }}
+          BACKUP_PROFILE: violeta
+          BACKUP_APPROVED_SHA: ${{ vars.BACKUP_APPROVED_SHA }}
+          BACKUP_VAULT_TOKEN: ${{ secrets.BACKUP_MONITOR_TOKEN }}
+          BACKUP_JOB_RESULT: ${{ needs.backup-violeta.result == 'skipped' && 'success' || needs.backup-violeta.result }}
