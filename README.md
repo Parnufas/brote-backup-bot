@@ -1,5 +1,7 @@
 # Brote Backup Bot — public controller
 
+> **Multi-project update (2026-11):** This controller now supports `brote` and `violeta` through separately scoped Environments. The detailed setup instructions below describe the existing **Brote** installation. For Violeta, follow [MULTIPROJECT.md](MULTIPROJECT.md). Do not enable Violeta before verifying Brote after controlled publication.
+
 This repository contains generic backup code and synthetic tests only. Do not upload application code, configuration JSON, database dumps, backup assets or credentials here.
 
 Daily backups and manual runs execute only on the approved commit of protected `main`, with Environment Secrets restricted to that branch. Lock `main` including administrators after reviewing the installed code. Set the repository variable `BACKUP_APPROVED_SHA` to the full reviewed commit SHA. Updating code requires explicit review, unlocking/relocking main and approving the new SHA. No second account or daily reviewer is required for an owner-operated frozen installation. This is owner review, not independent two-person approval.
